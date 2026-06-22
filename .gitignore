@@ -1,0 +1,11 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Build output
+broker
+/tmp/broker-*
+
+# OS
+.DS_Store

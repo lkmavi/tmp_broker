@@ -34,7 +34,7 @@ WARNINGS=0
 # 1. Go version
 log_info "Checking Go version..."
 GO_VERSION=$(go version | awk '{print $3}')
-REQUIRED="go1.22"
+REQUIRED="go1.25"
 if [[ "$GO_VERSION" < "$REQUIRED" ]]; then
     log_error "Go $REQUIRED+ required, found $GO_VERSION"
     ERRORS=$((ERRORS + 1))
