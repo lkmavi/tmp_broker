@@ -71,7 +71,10 @@ func (b *broker) put(w http.ResponseWriter, r *http.Request, name string) {
 	if len(q.waiters) > 0 {
 		ch := q.waiters[0]
 		q.waiters = q.waiters[1:]
-		ch <- v // buffered send, won't block while holding lock
+		// Send under the lock: ch has capacity 1 so this never blocks.
+		// This guarantees that once get() observes ch absent from waiters,
+		// the message is already buffered — safe to receive without the lock.
+		ch <- v
 	} else {
 		q.msgs = append(q.msgs, v)
 	}
@@ -79,9 +82,9 @@ func (b *broker) put(w http.ResponseWriter, r *http.Request, name string) {
 }
 
 // get dequeues and returns the next message from name.
-// If the queue is empty and the "timeout" parameter is a positive integer,
-// it waits up to that many seconds for a message to arrive.
-// Returns 404 when no message is available within the timeout.
+// If the queue is empty and timeout > 0, it waits up to that many seconds for a message.
+// Returns 404 on timeout. On client disconnect the waiter is removed and any
+// already-dispatched message is requeued so it is not lost.
 func (b *broker) get(w http.ResponseWriter, r *http.Request, name string) {
 	b.mu.Lock()
 	q := b.q(name)
@@ -104,23 +107,42 @@ func (b *broker) get(w http.ResponseWriter, r *http.Request, name string) {
 	q.waiters = append(q.waiters, ch)
 	b.mu.Unlock()
 
-	select {
-	case msg := <-ch:
-		fmt.Fprint(w, msg)
-	case <-time.After(time.Duration(timeout) * time.Second):
+	// removeWaiter removes ch from q.waiters under the lock.
+	// Returns true if removed (no message dispatched yet).
+	// Returns false if put() already claimed ch (message is buffered in ch).
+	removeWaiter := func() bool {
 		b.mu.Lock()
+		defer b.mu.Unlock()
 		for i, c := range q.waiters {
 			if c == ch {
 				q.waiters = append(q.waiters[:i], q.waiters[i+1:]...)
-				b.mu.Unlock()
-				w.WriteHeader(http.StatusNotFound)
-				return
+				return true
 			}
 		}
-		// put() already claimed this waiter and sent to ch before we re-locked.
-		// ch is buffered, so the message is waiting — read it without blocking.
-		b.mu.Unlock()
+		return false
+	}
+
+	timer := time.NewTimer(time.Duration(timeout) * time.Second)
+	defer timer.Stop()
+
+	select {
+	case msg := <-ch:
+		fmt.Fprint(w, msg)
+	case <-timer.C:
+		if removeWaiter() {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
 		fmt.Fprint(w, <-ch)
+	case <-r.Context().Done():
+		if removeWaiter() {
+			return
+		}
+		// put() dispatched to us before the disconnect was noticed; requeue to front.
+		msg := <-ch
+		b.mu.Lock()
+		q.msgs = append([]string{msg}, q.msgs...)
+		b.mu.Unlock()
 	}
 }
 

@@ -3,6 +3,7 @@
 package tests
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -428,5 +429,36 @@ func TestGet_ConcurrentPuts(t *testing.T) {
 	r.Body.Close()
 	if r.StatusCode != http.StatusNotFound {
 		t.Errorf("after draining: want 404, got %d", r.StatusCode)
+	}
+}
+
+// TestGet_ClientDisconnect verifies that when a waiting consumer disconnects,
+// its waiter slot is cleaned up and the queue continues to work correctly.
+func TestGet_ClientDisconnect(t *testing.T) {
+	s := suite.New(t)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, s.URL()+"/q?timeout=10", nil)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		resp, err := s.Client().Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	time.Sleep(100 * time.Millisecond) // ensure waiter is registered
+	cancel()                           // simulate client disconnect
+	<-done
+	time.Sleep(50 * time.Millisecond) // allow server goroutine to process cancellation
+
+	// Queue must accept and deliver new messages normally after cleanup.
+	s.PUT(t, "/q?v=after").Body.Close()
+	r := s.GET(t, "/q")
+	defer r.Body.Close()
+	b, _ := io.ReadAll(r.Body)
+	if r.StatusCode != http.StatusOK || string(b) != "after" {
+		t.Errorf("after disconnect: want 200/after, got %d/%q", r.StatusCode, string(b))
 	}
 }
